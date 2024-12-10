@@ -1,0 +1,155 @@
+#include "Arduino.h"
+#include "PubSubClient.h"
+#include "WiFi.h"
+#include "esp_wpa2.h"
+#include <Adafruit_Sensor.h>
+#include <MCMVoltSense.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+// Déclaration des grandeurs physiques
+float Pact;
+float Prea;
+float Papp;
+
+#define DHTPIN 4  
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+// Paramètres MQTT Broker
+const char *mqtt_broker = "172.23.46.193";
+const char *topic_temp = "temp";
+const char *topic_humi = "humi";
+const char *topic_Pact = "Pact";
+const char *topic_Prea = "Prea";
+const char *topic_Papp = "Papp";
+const char *mqtt_username = "m22009151";
+const char *mqtt_password = "Barbeapapa-13";
+const int mqtt_port = 1883;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Paramètres EDUROAM
+#define EAP_IDENTITY "antoine.maurens@etu.univ-amu.fr"
+#define EAP_PASSWORD "Barbeapapa-13"
+#define EAP_USERNAME "antoine.maurens@etu.univ-amu.fr"
+const char* ssid = "eduroam";
+
+// Constantes pour la mesure des puissances
+#define ACTectionRange 1
+#define VREF 5
+#define ADC_RESOLUTION 12
+#define ADC_MAX_VALUE ((1 << ADC_RESOLUTION) - 1)
+#define SIGNAL_FREQUENCY 50
+float phi = 0; // Déphasage dans le cas d'un appareil purement résistif
+MCMmeter meter;
+
+// Fonction pour lire le courant AC
+float readACCurrentValue() {
+  static float peakVoltage = 0;
+  float voltageVirtualValue = 0;
+
+  peakVoltage = 0;
+
+  for (int i = 0; i < 5; i++) {
+    peakVoltage += analogRead(36);
+  }
+  delay(1000);
+  peakVoltage = peakVoltage / 5;
+
+  voltageVirtualValue = peakVoltage * 0.707;
+  voltageVirtualValue = (voltageVirtualValue / ADC_MAX_VALUE) * VREF / 2;
+
+  return voltageVirtualValue * ACTectionRange;
+}
+
+// Fonction callback MQTT
+void callback(char *topic, byte *payload, unsigned int length) { 
+  Serial.print("Le message a été envoyé sur le topic : "); 
+  Serial.println(topic); 
+  Serial.print("Message:"); 
+  for (int i = 0; i < length; i++) { 
+    Serial.print((char) payload[i]); 
+  } 
+  Serial.println(); 
+  Serial.println("-----------------------"); 
+}
+
+// Initialisation
+void setup() { 
+  Serial.begin(115200);
+  dht.begin();
+  // Connexion au réseau EDUROAM
+  WiFi.disconnect(true);
+  WiFi.begin(ssid, WPA2_AUTH_PEAP, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD); 
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(F("."));
+  }
+
+  Serial.println("");
+  Serial.println(F("L'ESP32 est connecté au WiFi !"));
+
+  // Connexion au broker MQTT
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(callback);
+
+  while (!client.connected()) {
+    String client_id = "esp32-client-";
+    client_id += String(WiFi.macAddress());
+    Serial.printf("La chaîne de mesure %s se connecte au broker MQTT", client_id.c_str());
+    
+    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
+      Serial.println("La chaîne de mesure est connectée au broker.");
+    } else {
+      Serial.print("La chaîne de mesure n'a pas réussi à se connecter ... ");
+      Serial.print(client.state());
+      delay(2000);
+    }
+  }
+
+  // Configuration du capteur de tension
+  meter.VoltageStp(39, 523.56, 1.7);
+}
+
+// Boucle principale
+void loop() {
+
+
+  Serial.print(F("°C "));
+  float temp = dht.readTemperature();
+  float humi = dht.readHumidity();
+  client.publish(topic_temp, String(temp).c_str());
+  client.subscribe(topic_temp);
+  client.publish(topic_humi, String(humi).c_str());
+  client.subscribe(topic_humi);
+
+  // Mesure de la tension et du courant
+  float ACCurrentValue = readACCurrentValue();
+  meter.analogVoltage(40, 2000);
+  float Vrms = meter.Vrms;
+  float Intensite=-3.5619*ACCurrentValue*ACCurrentValue+16.188*ACCurrentValue+0.25;
+  float tension =1e-5*Vrms*Vrms+0.056*Vrms-10.171;
+  // Calcul des puissances
+  Papp = tension * Intensite;
+  float powerFactor = cos(phi * PI / 180);
+  Pact = Papp * powerFactor;
+  Prea = Papp * sin(phi * PI / 180);
+
+  Serial.print(F("Humidity: "));
+  Serial.print(humi);
+  Serial.print(F("%  Temperature: "));
+  Serial.print(temp);
+  // Publication des puissances
+  client.publish(topic_Papp, String(Papp).c_str());
+  client.subscribe(topic_Papp);
+  client.publish(topic_Pact, String(Pact).c_str());
+  client.subscribe(topic_Pact);
+  client.publish(topic_Prea, String(Prea).c_str());
+  client.subscribe(topic_Prea);
+
+  client.loop();
+  delay(5000);
+}
+
